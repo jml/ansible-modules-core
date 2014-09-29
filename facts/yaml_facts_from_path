@@ -1,0 +1,155 @@
+#!/usr/bin/env python
+
+DOCUMENTATION = '''
+---
+module: yaml_facts_from_path
+short_description: Load facts from YAML files contained in a specified path.
+author: Herby Gillot <herby.gillot@axial.net>
+description:
+    - This module recurses into the given path and locates any files with a
+      YAML extension.
+    - The YAML content for each of these files is then loaded, and all
+      variables or other data structure defined into these files are returned
+      as Ansible facts.
+    - Each fact is named in a format that looks like
+      <PATH_TO_FILE>_<FILE_NAME>_<VARIABLE_NAME>
+options:
+    path:
+        description: Path to the directory containing the YAML files to load
+        required: true
+    ignore_invalid_yaml:
+        If specified True, does not fail on invalid YAML files.
+note: This module reimplements a subset of Ansible functionality, but makes
+it possible to load facts from any arbitrary path as desired.
+'''
+
+EXAMPLES = '''
+---
+'''
+
+from operator import truth
+from yaml.error import YAMLError
+
+import os
+import re
+import sys
+import yaml
+
+YAML_EXT_REGEX = re.compile('\.ya?ml$', re.IGNORECASE)
+
+
+def check_path(path):
+    '''
+    Given a path, throw an exception if it doesn't exist, or isn't a directory.
+    '''
+    if not os.path.exists(path):
+        raise ValueError(
+            'Path "{}" does not exist, or cannot be found.'.format(path))
+
+    if not os.path.isdir(path):
+        raise TypeError('Path "{}" is not a directory.'.format(path))
+
+
+def collect_files_from_path(path, selection_function=None, onerror=None):
+    '''
+    Given a path, walk all children and pass each filename to an optionally
+    specified selection function.
+
+    Returns a list of all filenames for whom the selection_function returns
+    True.
+
+    If no selection_function is specified, all files are returned.
+
+    The onerror parameter is the same as expected by os.walk()
+    '''
+    if not selection_function:
+        selection_function = truth
+
+    results = list()
+
+    for root, subdirectories, filenames in os.walk(
+            path, onerror=onerror, followlinks=True):
+        for filename in filenames:
+            if selection_function(filename):
+                results.append(os.path.join(root, filename))
+
+    return results
+
+
+def has_yaml_extension(filename):
+    '''
+    Given a filename or path, return True if it looks like a YAML file, False
+    otherwise.
+    '''
+    return truth(re.search(YAML_EXT_REGEX, filename))
+
+
+def recursive_load_yaml_from_path(path, ignore_invalid_yaml=False):
+    '''
+    Given a path, finds all YAML files contained in the path and loads all
+    YAML content into a condensed results dictionary.
+
+    The dictionary is in the format {key: config} where key is a label formed
+    from the relative path of the configuration it was loaded from.
+    '''
+    config = dict()
+
+    yaml_files = collect_files_from_path(
+        path, selection_function=has_yaml_extension)
+
+    for yaml_file in yaml_files:
+        relative_path = yaml_file.replace(path + os.path.sep, '')
+        config_label = path_as_label(relative_path)
+
+        with open(yaml_file, 'r') as handle:
+            try:
+                yaml_content = yaml.safe_load(handle)
+            except YAMLError:
+                if not ignore_invalid_yaml:
+                    raise
+
+        if not yaml_content:
+            continue
+
+        config[config_label] = yaml_content
+
+    return config
+
+
+def path_as_label(path):
+    '''
+    Given a path, return it as a "label", meaning that the path string
+    is converted into an underscore-concatenated string that can be used
+    as an identifier.
+
+    Any non-alphanumerical characters are converted into underscors, including
+    path seperators.
+    '''
+    label = re.sub('[^\w\d]', '_', re.sub('\..*$', '', path))
+    return label
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            path=dict(required=True),
+            ignore_invalid_yaml=dict(type='bool', default=False)
+        )
+    )
+
+    path = module.params['path']
+
+    try:
+        check_path(path)
+        loaded_config = recursive_load_yaml_from_path(
+            path, ignore_invalid_yaml=module.params['ignore_invalid_yaml'])
+    except Exception, e:
+        module.fail_json(msg=str(e))
+
+    module.exit_json(changed=False, ansible_facts=loaded_config)
+    sys.exit(0)
+
+
+from ansible.module_utils.basic import *
+main()
