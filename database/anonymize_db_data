@@ -1,0 +1,767 @@
+#!/usr/bin/env python
+
+DOCUMENTATION = '''
+---
+module: anonymize_db_data
+short_description: >
+  Anonymize details such as email addresses or phone numbers within a database
+version_added: "1.6.10"
+description: >
+    This module connects to a database and scans for columns that look as if
+    they may contain email addresses and phone numbers.  These can then be
+    "anonymized", meaning the values in the column are replaced with
+    generated data.
+requirements: [ sqlalchemy ]
+options:
+  drivername:
+      required: true
+      description: Database driver to use to connect.
+      choices: [ "postgresql", "mysql", "mssql", "sqlite", "oracle" ]
+  database:
+      required: false
+      description: Name of the database to connect to
+  username:
+      required: false
+      description: Username to login to the database with
+  password:
+      required: false
+      description: Password to login to the database with
+  host:
+      required: false
+      description: Hostname or address to connect to
+  port:
+      required: false
+      description: Alternate port to connect to if different from default
+  url:
+      required: false
+      description: >
+          SQLAlchemy connection string. See
+          http://docs.sqlalchemy.org/en/rel_0_9/core/engines.html?highlight=url#database-urls
+          If specified, all other connection parameters, such as host or
+          username are ignored.
+  dry_run:
+      required: false
+      description: >
+          If specified, queries are not run.  Instead, for each column, the
+          query that would be run is returned instead.
+  template_user:
+      required: false
+      description: >
+          User part to use when generating placeholder email address.
+      default: 'user'
+  template_domain:
+      required: false
+      description: >
+          Domain part to use when generating placeholder email address.
+      default: 'example.com'
+  excluded_domains:
+      required: false
+      description: >
+          List of domains whose email addresses are excluded from the
+          "anonymization" process.
+  only:
+      required: false
+      description: >
+          List of columns or tables to *only* anonymize.  Specified as a list
+          in the format 'table.column'.  To specify all columns in a table, use
+          'table.'.  Conversely, to specify a particular column name across all
+          tables, use '.column'
+  additional:
+    required: false
+    description: >
+        Specify an explicit list of columns and the query function to use
+        to anonymize it.  Query functions as of now can either by 'email'
+        or 'phone'.  Example: { 'mytable.mycolumn': 'email' }les, use '.column'
+  ignored:
+      required: false
+      description: >
+          Specified in the same format as the 'only' parameter.  Any columns
+          specified in this list are not anonymized.
+  enable_log:
+      required: false
+      description: >
+      If set to True, adds log details to the results returned by this
+      module.
+  debug:
+      required: false
+      description: >
+          When set to True, includes the internal SQL being executed by
+          this module in the log.
+author: Herby Gillot <herby.gillot@axial.net>
+'''
+
+EXAMPLES = '''
+# Anonymize data in a local Postgres database, but don't change email
+# addresses ending in mydomain.net, and don't touch any columns named
+# 'email_type'.
+
+- name: Anonymize the data
+  anonymize_db_data:
+    database: my_database
+    drivername: postgresql
+    excluded_domains:
+      - 'mydomain.net'
+    ignored:
+      - '.email_type'
+
+
+# Only change columns inside the 'user_info' table, and don't touch any other
+# tables, regardless of whether or not their columns are anonymizable.
+
+- name: Anonymize user_info table
+  anonymize_db_data:
+    database: my_db
+    drivername: postgresql
+    only:
+    - 'user_info.'
+
+
+# Explicitly anonymize 2 columns in the 'registry' table.
+
+- name: Anonymize registry contact columns
+  anonymize_db_data:
+    database: the_database
+    drivername: postgresql
+    additional:
+        'registry.destination_mail':  'email'
+        'registry.home_number':       'phone'
+'''
+
+import logging
+import sys
+import time
+
+from collections import Container
+from functools import partial
+from itertools import chain
+from logging.handlers import MemoryHandler
+from operator import eq, lt, truth
+from traceback import format_exc
+from multiprocessing.dummy import Pool, current_process
+
+try:
+    from sqlalchemy import MetaData, create_engine, event
+except ImportError:
+    print "failed=True msg='sqlalchemy is required for this module'"
+    sys.exit(1)
+
+import sqlalchemy.types
+
+from sqlalchemy.engine.url import URL
+from sqlalchemy.sql.expression import \
+    and_, bindparam, cast, not_, null, select as sql_select, update
+from sqlalchemy.sql.functions import concat, func, random
+from sqlalchemy.sql.schema import Column, Table
+
+
+###############################################################################
+CONNECTION_PARAMS = \
+    ['drivername', 'username', 'password', 'host', 'port', 'database']
+
+stringparam = partial(bindparam, type_=sqlalchemy.types.String)
+
+
+class NonFlushingMemoryHandler(MemoryHandler):
+    '''
+    A log handler which buffers logging records to memory.
+
+    Unlike the standard MemoryHandler, this handler does not flush records or
+    enforce capacity limits.
+    '''
+    def __init__(self, buf):
+        MemoryHandler.__init__(self, None)
+        self.buffer = buf
+
+    def emit(self, record):
+        msg = self.format(record)
+        self.buffer.append(msg)
+
+    def shouldFlush(self, record):
+        return False
+
+    def flush(self):
+        pass
+
+
+class ColumnSpec(Container):
+    '''
+    A ColumnSpec is a collection of ColumnPatterns.
+
+    Columns or Tables can then be compared against this collection of patterns.
+    '''
+    def __init__(self, pattern_strings):
+        self.patternlist = [ColumnPattern(pattern_str) for pattern_str in
+                            pattern_strings]
+
+    @property
+    def tables(self):
+        '''
+        Return the list of all patterns that are tables.
+        (Basically column patterns that look like 'foobar.')
+        '''
+        return [pattern for pattern in self.patternlist if pattern.is_table()]
+
+    def __contains__(self, other):
+        '''
+        If checking a Table or Column, return True if this Table or Column
+        object matches any of the column patterns we contain.
+        '''
+        matches_pattern = lambda spec: spec == other
+        pattern_contains = lambda spec: other in spec
+
+        return (any(map(matches_pattern, self.patternlist))
+                or any(map(pattern_contains, self.patternlist)))
+
+    def __len__(self):
+        return len(self.patternlist)
+
+    def __nonzero__(self):
+        return truth(self.patternlist)
+
+    def __repr__(self):
+        return repr(self.patternlist)
+
+
+class ColumnPattern(object):
+    '''
+    A ColumnPattern is basically a pattern that matches one or more columns.
+    It is represented as (and initialized from) a string in the format
+    'table.column'.
+
+    Format:
+    'table.' - represents a particular table, or all columns in this table.
+    '.column' - represents all columns with this particular column name,
+                regardless of which table they're in
+    'table.column' -  explicitly represents a particular column in the named
+                      table.
+
+    Column or Table objects can be compared against a ColumnPattern using
+    "==" or the "in" keyword.
+
+    ColumnPatterns can also be initialize from Column or FakeColumn objects,
+    creating a ColumnPattern instance that matches only that column.
+    '''
+
+    def __init__(self, pattern):
+        if isinstance(pattern, basestring):
+            parts = pattern.rpartition('.')
+            self._table = parts[0]
+            self._column = parts[2]
+        elif isinstance(pattern, Column) or isinstance(pattern, FakeColumn):
+            self._table = pattern.table.name
+            self._column = pattern.name
+        else:
+            raise ValueError('Expecting either string or column object.')
+
+    def is_table(self):
+        return (self.table and not self.column)
+
+    def is_column(self):
+        return (self.table and self.column)
+
+    @property
+    def table(self):
+        return self._table
+
+    @property
+    def column(self):
+        return self._column
+
+    def __eq__(self, other):
+        if isinstance(other, type(self)):
+            return self.__dict__ == other.__dict__
+        # true if this ColumnPattern represents a particular column, and
+        # the object we're looking at is a matching Column object.
+        elif isinstance(other, Column) or isinstance(other, FakeColumn):
+            return ((other.table.name == self.table) or (not self.table)) and \
+                other.name == self.column
+        # true if this Column pattern is a table, and the provided object
+        # we're looking at is a Table with the same name as the
+        # pattern's table.
+        elif isinstance(other, Table):
+            return self.is_table() and (other.name == self.table)
+        return False
+
+    def __ne__(self, other):
+        return not(eq(self, other))
+
+    def __contains__(self, other):
+        # returns true if this ColumnPattern represents a table, and the
+        # provided object we're looking at is a column, and that column is
+        # in this table.
+        if isinstance(other, Column) or isinstance(other, FakeColumn):
+            return self.is_table() and (other.table.name == self.table)
+        return False
+
+    def __hash__(self):
+        return hash(tuple([self.table, self.column]))
+
+    def __str__(self):
+        return '{}.{}'.format(self.table, self.column)
+
+    def __repr__(self):
+        return '{}("{}")'.format(self.__class__.__name__, str(self))
+
+
+class FakeColumn(object):
+
+    def __init__(self, table_name, column_name):
+        class FakeTable(object):
+            pass
+
+        self.table = FakeTable()
+        self.table.name = table_name
+        self.name = column_name
+
+
+def email_address_anonymizer_query(
+        column, template_user='user', template_domain='example.com',
+        excluded_domains=[], check=False, hash_func=None, **kwargs):
+    '''
+    Returns an UPDATE query that replaces the values in the specified column
+    with anonymized email addresses.
+
+    Anonymized addresses have the format:
+
+    '<user>+XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX@<domain>'
+
+    ...where XXXX... is a hash of the original column value.
+
+    If template_user is specified, that value is used as the user part for
+    the generated placeholder address.
+
+    If template_domain is specified, that value is used as the domain part
+    for the generated placeholder address.
+
+    If excluded_domains is specified as a list, any original email addresses
+    whose domain is in this list will be preserved, and excluded from
+    anonymization.
+
+    If 'hash_func' is not specified, MD5 will be used to generate the hash
+    of the original column.
+
+    If check is enabled, instead of an UPDATE query, a SELECT query that
+    simply SELECTS unanonymized values for this column is returned.
+    '''
+    user_param = stringparam('user', value=template_user)
+    domain_param = stringparam('domain', value=template_domain)
+
+    if not hash_func:
+        # MD5 by default, though there are definitely much more secure ways of
+        # doing this.
+        hash_func = func.md5
+
+    if excluded_domains:
+        all_excluded_domains = set(excluded_domains)
+    else:
+        all_excluded_domains = set()
+
+    all_excluded_domains.add(template_domain)
+
+    def not_ends_with_domain_expr(domain):
+        return not_(column.endswith("@" + domain))
+
+    # generate a list of expressions that when ANDed together will match
+    # any address whose domain does not end with any one of the specified
+    # excluded domains.
+    excluded_domains_expr_list = \
+        map(not_ends_with_domain_expr, all_excluded_domains)
+
+    # generate an expression that matches columns that are not currently
+    # anonymized
+    not_anonymized_expr = \
+        not_(column.like(user_param + "+%@" + domain_param))
+
+    # generate an expression that returns a string in the format
+    # user+<hash>@domain.com, where <hash> is the hash of the original value
+    anonymized_address_expr = \
+        concat(user_param + "+", hash_func(column), "@" + domain_param)
+
+    where_clause = and_(column != null(),
+                        not_anonymized_expr,
+                        *excluded_domains_expr_list)
+
+    if check:
+        # In Ansible check mode:
+        # Return a query only _selecting_ the rows that we would modify.
+        action = sql_select([column])
+    else:
+        action = update(column.table).values(
+            **{column.name: anonymized_address_expr})
+
+    query = action.where(where_clause)
+
+    return query
+
+
+def phone_number_anonymizer_query(
+        column, area_code='555', check=False, **kwargs):
+    '''
+    Return a query that replaces all the values in this column with
+    anonymized phone numbers, that look like 555-NNN-NNNN.
+
+    If area_code is specified, its value will be used of the resultant
+    anonymized phone number, instead of 555.
+    '''
+
+    ac_param = stringparam('area_code', value=area_code)
+
+    def make_randnum_expr(numlen):
+        '''
+        Given a length, return a SQL expression that would create a random
+        number of that length.
+        '''
+        return func.lpad(
+            cast(func.round(random().op('*')(int('9' * numlen))),
+                 sqlalchemy.types.String),
+            numlen, '0')
+
+    # expression that generates a random number like 555-NNN-NNNN
+    phone_number_expr = \
+        concat(ac_param, make_randnum_expr(3), "-", make_randnum_expr(4))
+
+    # where clause that matches any non-null column that does not begin
+    # with the template area code
+    where_clause = and_(column != null(), not_(column.startswith(ac_param)))
+
+    if check:
+        # In Ansible check mode:
+        # Return a query only _selecting_ the rows that we would modify.
+        action = sql_select([column])
+    else:
+        action = update(column.table).values(
+            **{column.name: phone_number_expr})
+
+    query = action.where(where_clause)
+
+    return query
+
+
+class DBAnonymizer(object):
+
+    QUERY_FUNC_MAP = {
+        'email': email_address_anonymizer_query,
+        'phone': phone_number_anonymizer_query
+    }
+
+    def __init__(self, params):
+        self.params = params
+        self._set_connection_params()
+        self.metadata = MetaData()
+
+        self.only = ColumnSpec(self.params['only'])
+        self.ignored = ColumnSpec(self.params['ignored'])
+        self.explicit_columns = dict()
+        self._set_additional_columns()
+
+        # subscribe our column decorator function to column reflection events
+        event.listens_for(Table, 'column_reflect')(
+            self.column_decorator_callback)
+
+    def _worker(self, columns):
+        '''
+        Thread worker
+
+        Expects a list of columns to process, and returns a list of result
+        tuples for each processed column.
+
+        For each column, the result tuple is in the form (column, result)
+        where result is:
+
+        - int:
+            * postive integer for the count of rows that were (or _would_ be
+              changed)
+            * 0 if no changes were or would be made
+            * -1 on error
+
+        - string on dry run, the string being the query that *would* be run
+        '''
+        results = list()
+
+        engine = self.create_engine()
+        procname = current_process().name
+
+        def log(message):
+            logging.info('{}: {}'.format(procname, message))
+
+        try:
+            log('Connecting to database...')
+            conn = engine.connect()
+        except Exception:
+            log('Failure while connecting to database: {}'.format(
+                format_exc()))
+            for column in columns:
+                results.append((column_name(column), -1))
+            return results
+
+        def worker_action(column):
+            colname = column_name(column)
+
+            query = column.info['query_func'](column, **self.params)
+            compiled_query = str(query.compile(engine,
+                                 compile_kwargs={'literal_binds': True}))
+
+            if self.params['dry_run']:
+                results.append((colname, compiled_query))
+            else:
+
+                try:
+                    start_time = time.time()
+                    log('Executing query "{}" for column "{}"'.format(
+                        compiled_query, colname))
+                    query_result = conn.execute(query)
+                    log('Completed query for "{}" in {} seconds'.format(
+                        colname, round(time.time() - start_time, 2)))
+                except Exception:
+                    log('Exception while executing query "{}" for column "{}"'
+                        .format(compiled_query, colname) + "\n" + format_exc())
+                    results.append((colname, -1))
+
+                results.append((colname, query_result.rowcount))
+
+        for column in columns:
+            worker_action(column)
+
+        return results
+
+    def anonymize_columns(self, metadata=None):
+        '''
+        Given a list of columns, connect to the configured database and
+        perform anonymization.
+
+        Anonymization is performed by executing the query function specified
+        by 'query_func' in the column's user data dictionary against the
+        column. (This is set by the column decorator during reflection).
+
+        Columns missing this are ignored.
+
+        Returns a list of results where each result is a tuple in the format:
+        (column, result)
+
+        The result tuple is described in more detail in _worker()
+        '''
+        results = list()
+
+        if not metadata:
+            metadata = self.metadata
+
+        get_columns = lambda table: table.columns.values()
+        has_query_func = lambda column: 'query_func' in column.info
+
+        column_groups = filter(
+            None, map(partial(filter, has_query_func),
+                      map(get_columns, metadata.tables.values())))
+
+        group_count = len(column_groups)
+
+        if group_count == 0:
+            return results
+
+        pool = Pool(processes=group_count)
+        results = pool.map(self._worker, column_groups, chunksize=1)
+
+        return list(chain.from_iterable(results))
+
+    def column_decorator_callback(self, inspector, table, column_info):
+        '''
+        Adds information to the column's .info attribute, which sets the
+        query function to use for anonymization.
+
+        Note: This method is meant to be subscribed to SQLAlchemy column
+              reflection events.
+        '''
+        column_name = column_info.get('name', '')
+
+        # we are only interested in string columns
+        if not isinstance(column_info.get('type'), sqlalchemy.types.String):
+            return
+
+        colobj = FakeColumn(table.name, column_name)
+        query_func = self.determine_query_func(column_name)
+
+        def set_query_func():
+            column_info['info'] = {'query_func': query_func}
+
+        if self.explicit_columns:
+            temp_pattern = ColumnPattern(colobj)
+
+            if temp_pattern in self.explicit_columns:
+                column_info['info'] = \
+                    {'query_func': self.explicit_columns[temp_pattern]}
+                return
+
+        if self.only:
+            if (colobj in self.only) and query_func:
+                set_query_func()
+            return
+
+        if colobj in self.ignored:
+            return
+
+        if query_func:
+            set_query_func()
+
+    def create_engine(self):
+        '''
+        Return an Engine instance as per module configuration.
+        '''
+        return create_engine(self.connection_config)
+
+    @classmethod
+    def determine_query_func(cls, column_name):
+        '''
+        Select the appropriate query function to use given a column's name.
+        '''
+        for func_type in cls.QUERY_FUNC_MAP:
+            if func_type in column_name:
+                return cls.QUERY_FUNC_MAP[func_type]
+        return None
+
+    @classmethod
+    def get_query_func_for_type(cls, column_type):
+        '''
+        Returns the query function to use given a specified column type.
+        '''
+        return cls.QUERY_FUNC_MAP.get(column_type, None)
+
+    def load_metadata(self):
+        '''
+        Connects to the configured database and populates this instance's
+        metadata from database schema.
+        '''
+        engine = self.create_engine()
+        self.metadata.reflect(bind=engine)
+
+    def _set_additional_columns(self):
+        '''
+        Set additional columns from the 'additional' module parameter.
+        '''
+        if not self.params['additional']:
+            return
+
+        for (column_name, query_type) in self.params['additional'].items():
+            column_pattern = ColumnPattern(column_name)
+
+            if not column_pattern.is_column():
+                raise ValueError(
+                    ('Unexpected additional column name "{}"; additional ' +
+                     'columns must be specified as "table.column"')
+                    .format(column_name))
+
+            query_func = self.get_query_func_for_type(query_type)
+
+            if not query_func:
+                raise ValueError(
+                    'Unsupported data type: {}'.format(query_type))
+
+            self.explicit_columns[column_pattern] = query_func
+
+    def _set_connection_params(self):
+        '''
+        Verify required parameters, set connection configuration.
+        '''
+        conn_params = \
+            {p: self.params[p] for p in self.params if p in CONNECTION_PARAMS}
+
+        if (not conn_params) and ('url' not in self.params):
+            raise ValueError(
+                'Either of "url" or a subset of "{}" is required.'.format(
+                    CONNECTION_PARAMS))
+
+        if self.params.get('url'):
+            self.connection_config = self.params['url']
+        else:
+            self.connection_config = URL(**conn_params)
+
+
+def column_name(column):
+    return '{}.{}'.format(column.table.name, column.name)
+
+
+def setup_logging(handler, debug=False):
+    logger = logging.getLogger()
+    handler.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(handler)
+
+    if debug:
+        sql_log = logging.getLogger('sqlalchemy.engine')
+        sql_log.setLevel(logging.INFO)
+
+
+def main():
+
+    module = AnsibleModule(
+        argument_spec=dict(
+            drivername=dict(),
+            username=dict(),
+            password=dict(),
+            host=dict(),
+            port=dict(),
+            database=dict(),
+            url=dict(),
+            dry_run=dict(type='bool', default=False),
+            only=dict(type='list', default=[]),
+            ignored=dict(type='list', default=[]),
+            additional=dict(type='dict'),
+            excluded_domains=dict(type='list'),
+            template_user=dict(default='user'),
+            template_domain=dict(default='example.com'),
+            enable_log=dict(type='bool', default=False),
+            debug=dict(type='bool', default=False)),
+        supports_check_mode=True
+    )
+
+    if module.check_mode:
+        module.params['check'] = True
+
+    module_log = list()
+
+    setup_logging(
+        NonFlushingMemoryHandler(module_log),
+        debug=module.params['debug'])
+
+    anonymizer = DBAnonymizer(module.params)
+
+    try:
+        anonymizer.load_metadata()
+    except Exception:
+        module.fail_json(
+            msg='Fatal error while getting database schema information: ' +
+                '\n{}\n'.format(format_exc()))
+
+    try:
+        results = anonymizer.anonymize_columns()
+    except Exception:
+        module.fail_json(
+            msg='Fatal error while anonymizing columns: \n{}\nLog:\n{}'
+                .format(format_exc(), module_log))
+
+    def test_results(results_list, test):
+        test_item = lambda item: isinstance(item[1], int) and test(item[1])
+        return any(map(test_item, results_list))
+
+    is_error = partial(eq, -1)
+    is_changed = partial(lt, 0)
+
+    if module.params['dry_run']:
+        module.exit_json(results=results, changed=False)
+
+    if test_results(results, is_error):
+        module.fail_json(msg='Errors encountered. Log:\n{}'.format(module_log))
+
+    final_results = {'columns': results}
+
+    if module.params['enable_log']:
+        final_results['log'] = module_log
+
+    module.exit_json(
+        changed=test_results(results, is_changed),
+        results=final_results)
+
+    sys.exit(0)
+
+from ansible.module_utils.basic import *
+from ansible.module_utils.ec2 import *
+
+main()
