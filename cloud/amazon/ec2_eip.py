@@ -207,7 +207,7 @@ def allocate_address(ec2, domain, module, reuse_existing_ip_allowed):
         domain_filter = { 'domain' : 'standard' }
       all_addresses = ec2.get_all_addresses(filters=domain_filter)
 
-      unassociated_addresses = filter(lambda a: a.instance_id == "", all_addresses)
+      unassociated_addresses = filter(lambda a: not a.instance_id, all_addresses)
       if unassociated_addresses:
         address = unassociated_addresses[0];
       else:
@@ -281,9 +281,9 @@ def main():
     reuse_existing_ip_allowed = module.params.get('reuse_existing_ip_allowed')
     new_eip_timeout = int(module.params.get('wait_timeout'))
 
-    def allocate_eip(eip_domain, reuse_ip):
+    def allocate_eip(eip_domain):
         # Allocate a new elastic IP
-        address = allocate_address(ec2, eip_domain, module, reuse_ip)
+        address = allocate_address(ec2, eip_domain, module, reuse_existing_ip_allowed)
         # overriding the timeout since this is a a newly provisioned ip
         global wait_timeout
         wait_timeout = new_eip_timeout
@@ -296,14 +296,14 @@ def main():
             module.fail_json(
                 msg='instance_id or public_ip should not be specified if only'+
                     ' allocating an elastic IP.')
-        address = allocate_eip(domain, reuse_existing_ip_allowed)
+        address = allocate_eip(domain)
         module.exit_json(changed=True, public_ip=address.public_ip)
 
     elif state == 'present':
         # If both instance_id and public_ip are not specified, fall back on
         # previous behavior, which is to allocate a new elastic IP, and exit.
         if not instance_id and not public_ip:
-            address = allocate_eip(domain, reuse_existing_ip_allowed)
+            address = allocate_eip(domain)
             module.exit_json(changed=True, public_ip=address.public_ip)
 
         # Return the EIP object since we've been given a public IP
@@ -323,7 +323,7 @@ def main():
 
             # If the instance is not already associated with an elastic IP,
             # allocate a new one.
-            address = allocate_eip(domain, reuse_existing_ip_allowed)
+            address = allocate_eip(domain)
 
         # Associate address object (provided or allocated) with instance           
         associate_ip_and_instance(ec2, address, instance_id, module)
