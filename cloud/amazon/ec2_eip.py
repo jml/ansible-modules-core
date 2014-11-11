@@ -142,7 +142,7 @@ def disassociate_ip_and_instance(ec2, address, instance_id, module):
         module.fail_json(msg="disassociation failed")
 
 
-def find_address(ec2, public_ip, module):
+def find_address(ec2, public_ip, module, fail_on_not_found=True):
     """ Find an existing Elastic IP address """  
     if wait_timeout != 0:
         timeout = time.time() + wait_timeout
@@ -152,7 +152,8 @@ def find_address(ec2, public_ip, module):
                 break
             except boto.exception.EC2ResponseError, e:
                 if "Address '%s' not found." % public_ip in e.message :
-                    pass
+                    if not fail_on_not_found:
+                        return None
                 else:
                     module.fail_json(msg=str(e.message))
             time.sleep(5)
@@ -163,6 +164,9 @@ def find_address(ec2, public_ip, module):
         try:
             addresses = ec2.get_all_addresses([public_ip])
         except boto.exception.EC2ResponseError, e:
+            if "Address '%s' not found." % public_ip in e.message :
+                if not fail_on_not_found:
+                    return None
             module.fail_json(msg=str(e.message))
 
     return addresses[0]
@@ -176,6 +180,17 @@ def ip_is_associated_with_instance(ec2, public_ip, instance_id, module):
     else:
         return False
 
+def instance_is_associated(ec2, instance, module):
+    """
+    Check if the given instance object is already associated with an
+    elastic IP
+    """
+    instance_ip = instance.ip_address
+    instance_id = instance.id
+    if not instance_ip:
+        return False
+    eip = find_address(ec2, instance_ip, module, fail_on_not_found=False)
+    return (eip and (eip.public_ip == instance_ip))
 
 def allocate_address(ec2, domain, module, reuse_existing_ip_allowed):
     """ Allocate a new elastic IP address (when needed) and return it """
@@ -277,6 +292,12 @@ def main():
         # Allocate an IP for instance since no public_ip was provided
         if  instance_id and not public_ip: 
             instance = find_instance(ec2, instance_id, module)
+
+            # Do nothing if the instance is already associated with an
+            # elastic IP.
+            if instance_is_associated(ec2, instance, module):
+                module.exit_json(changed=False, public_ip=instance.ip_address)
+
             if instance.vpc_id:
                 domain = "vpc"
             address = allocate_address(ec2, domain, module, reuse_existing_ip_allowed)
