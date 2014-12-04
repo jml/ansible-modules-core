@@ -18,10 +18,11 @@ options:
     required: false
   state:
     description:
+      _ If allocate, allocates a new elastic IP.
       - If present, associate the IP with the instance.
       - If absent, disassociate the IP with the instance.
     required: false
-    choices: ['present', 'absent']
+    choices: ['allocate', 'present', 'absent']
     default: present
   region:
     description:
@@ -74,6 +75,9 @@ EXAMPLES = '''
 - name: output the IP
   debug: msg="Allocated IP is {{ eip.public_ip }}"
 
+- name: another way of allocating an elastic IP without associating it to anything
+  ec2_eip: state='allocate'
+
 - name: provision new instances with ec2
   ec2: keypair=mykey instance_type=c1.medium image=ami-40603AD1 wait=yes group=webserver count=3
   register: ec2
@@ -94,7 +98,6 @@ except ImportError:
     boto_found = False
 else:
     boto_found = True
-
 
 wait_timeout = 0  
 
@@ -142,7 +145,7 @@ def disassociate_ip_and_instance(ec2, address, instance_id, module):
         module.fail_json(msg="disassociation failed")
 
 
-def find_address(ec2, public_ip, module):
+def find_address(ec2, public_ip, module, fail_on_not_found=True):
     """ Find an existing Elastic IP address """  
     if wait_timeout != 0:
         timeout = time.time() + wait_timeout
@@ -152,7 +155,8 @@ def find_address(ec2, public_ip, module):
                 break
             except boto.exception.EC2ResponseError, e:
                 if "Address '%s' not found." % public_ip in e.message :
-                    pass
+                    if not fail_on_not_found:
+                        return None
                 else:
                     module.fail_json(msg=str(e.message))
             time.sleep(5)
@@ -163,6 +167,9 @@ def find_address(ec2, public_ip, module):
         try:
             addresses = ec2.get_all_addresses([public_ip])
         except boto.exception.EC2ResponseError, e:
+            if "Address '%s' not found." % public_ip in e.message :
+                if not fail_on_not_found:
+                    return None
             module.fail_json(msg=str(e.message))
 
     return addresses[0]
@@ -176,6 +183,16 @@ def ip_is_associated_with_instance(ec2, public_ip, instance_id, module):
     else:
         return False
 
+def instance_is_associated(ec2, instance, module):
+    """
+    Check if the given instance object is already associated with an
+    elastic IP
+    """
+    instance_ip = instance.ip_address
+    if not instance_ip:
+        return False
+    eip = find_address(ec2, instance_ip, module, fail_on_not_found=False)
+    return (eip and (eip.public_ip == instance_ip))
 
 def allocate_address(ec2, domain, module, reuse_existing_ip_allowed):
     """ Allocate a new elastic IP address (when needed) and return it """
@@ -190,7 +207,7 @@ def allocate_address(ec2, domain, module, reuse_existing_ip_allowed):
         domain_filter = { 'domain' : 'standard' }
       all_addresses = ec2.get_all_addresses(filters=domain_filter)
 
-      unassociated_addresses = filter(lambda a: a.instance_id == "", all_addresses)
+      unassociated_addresses = filter(lambda a: not a.instance_id, all_addresses)
       if unassociated_addresses:
         address = unassociated_addresses[0];
       else:
@@ -239,7 +256,7 @@ def main():
             instance_id = dict(required=False),
             public_ip = dict(required=False, aliases= ['ip']),
             state = dict(required=False, default='present',
-                         choices=['present', 'absent']),
+                         choices=['allocate', 'present', 'absent']),
             in_vpc = dict(required=False, type='bool', default=False),
             reuse_existing_ip_allowed = dict(required=False, type='bool', default=False),
             wait_timeout = dict(default=300),
@@ -264,25 +281,49 @@ def main():
     reuse_existing_ip_allowed = module.params.get('reuse_existing_ip_allowed')
     new_eip_timeout = int(module.params.get('wait_timeout'))
 
-    if state == 'present':
-        # Allocate an EIP and exit
-        if not instance_id and not public_ip:     
-            address = allocate_address(ec2, domain, module, reuse_existing_ip_allowed)
+    def allocate_eip(eip_domain):
+        # Allocate a new elastic IP
+        address = allocate_address(ec2, eip_domain, module, reuse_existing_ip_allowed)
+        # overriding the timeout since this is a a newly provisioned ip
+        global wait_timeout
+        wait_timeout = new_eip_timeout
+        return address
+
+    if state == 'allocate':
+        # If we're allocating a new IP, stop if the user also specified an
+        # instance or IP address.
+        if instance_id or public_ip:
+            module.fail_json(
+                msg='instance_id or public_ip should not be specified if only'+
+                    ' allocating an elastic IP.')
+        address = allocate_eip(domain)
+        module.exit_json(changed=True, public_ip=address.public_ip)
+
+    elif state == 'present':
+        # If both instance_id and public_ip are not specified, fall back on
+        # previous behavior, which is to allocate a new elastic IP, and exit.
+        if not instance_id and not public_ip:
+            address = allocate_eip(domain)
             module.exit_json(changed=True, public_ip=address.public_ip)
 
         # Return the EIP object since we've been given a public IP
         if public_ip:
             address = find_address(ec2, public_ip, module)
 
-        # Allocate an IP for instance since no public_ip was provided
-        if  instance_id and not public_ip: 
+        if instance_id and not public_ip:
             instance = find_instance(ec2, instance_id, module)
+
             if instance.vpc_id:
                 domain = "vpc"
-            address = allocate_address(ec2, domain, module, reuse_existing_ip_allowed)
-            # overriding the timeout since this is a a newly provisioned ip
-            global wait_timeout
-            wait_timeout = new_eip_timeout       
+
+            # Do nothing if the instance is already associated with an
+            # elastic IP.
+            if instance_is_associated(ec2, instance, module):
+                module.exit_json(changed=False, public_ip=instance.ip_address)
+
+            # If the instance is not already associated with an elastic IP,
+            # allocate a new one.
+            address = allocate_eip(domain)
 
         # Associate address object (provided or allocated) with instance           
         associate_ip_and_instance(ec2, address, instance_id, module)
