@@ -11,36 +11,48 @@ options:
   nacl:
     description:
       - An identifier (ACL ID, CIDR, tagged name) identifying a network ACL.
-      - If not specified, a ruleset, if present will be used locate the NACL.
+      - If this parameter isn't specified, then a ruleset, if present, will be used to match a NACL with the same rules.
     required: false
+  name:
+    description:
+      - Alias, same as 'nacl'
   vpc:
     description:
       - An identifer (VPC ID, CIDR, tagged name) identifying the VPC.
       - This is the VPC containing the network ACL of interest.
       - This parameter is useful for disambiguating a network ACL, especially when using a non-specific NACL identifer, such as name, which could be shared by multiple ACLs over different VPCs.
     required: false
+  vpc_id:
+    description:
+      - Alias for 'vpc'
   egress:
     description:
-      - List of rules for outgoing traffic.
-      - Each rule can be specified as a dict or list.
-      - Refer to examples or notes below for information on how defining rules.
+      - A list of rules for outgoing traffic.
+      - Each rule can be specified as a dictionary or list.
+      - Refer to examples or notes below for information on defining rules.
     required: false
   ingress:
     description:
       - List of rules for incoming traffic.
-      - Each rule can be specified as a dict or list.
-      - Refer to examples or notes below for information on how defining rules.
+      - Each rule can be specified as a dictionary or list.
+      - Refer to examples or notes below for information on defining rules.
     required: false
+  rules:
+    description:
+      - Alias for 'ingress'
+  rules_egress:
+    description:
+      - Alias for 'egress'
   region:
     description:
-      - the EC2 region to use
+      - The EC2 region to connect to.  Usually should be specified.
     required: false
     default: null
     aliases: [ ec2_region ]
   subnets:
     description:
-      - The list of subnets that should be associated with the specified NACL.
-      - This is the list of subnets that are associated back to the default network ACL when in disassociation mode (state is 'dissasociate').
+      - The list of subnets that should be associated with the specified network ACL.
+      - This is the list of subnets that are associated back to the default network ACL when in disassociation mode (state is 'dissasociated').
       - Must be specified as a list
       - Each subnet can be specified as subnet ID, CIDR or its tagged name.
     required: false
@@ -55,15 +67,15 @@ options:
   use_default_nacl:
     description:
       - If specified and set to True, the default NACL for a VPC will be used.
-      - Requires a VPC to be specified.
+      - Requires that the VPC to be specified.
       - Cannot be specified at the same time as the 'nacl' parameter.
     default: False
   state:
     description:
       - If 'present' and the NACL & egress/ingress rulesets are specified, modifies the ACL to match the rules defined in the rulesets.
-      - If 'present' and NACL not defined, but egress/ingress rulesets are, creates a new network ACL matching the rulesets.
+      - If 'present' and no NACL identifier is provided, but egress/ingress rulesets are, will create a new network ACL matching the rulesets.
       - If 'present' or 'associated' and subnets are listed, ensures that these subnets are associated with the identified/created network ACL.
-      - If 'disassociated' and a list of subnets is provided, ensures that these subnets are disassociated with any user-defined NACLs, and re-associated with the default NACL.
+      - If 'disassociated' and a list of subnets is provided, ensures that these subnets are disassociated with any user-defined NACLs, and re-associated with the default NACL for their respective VPC.
       - If 'absent', disassociates any subnets associated with the specified network ACL, and then ensures it no longer exists.
       - If 'list', list all network ACLs found.  Restricts listing to a particular VPC is VPC is specified.
     required: false
@@ -73,16 +85,16 @@ options:
 extends_documentation_fragment: aws
 author: Herby Gillot <herby.gillot@gmail.com>
 notes:
-  - Network ACLs are located first by the 'nacl' identifier, and then if not found, by ruleset.  The network ACL used will be the one whose egress and ingress rules match the specified egress and ingress rules exactly (excluding the default egress/ingress rules).
+  - Network ACLs are located first by the 'nacl' identifier, and then if that isn't found or specified, locates by ruleset (if specified).  The network ACL used will be the one whose egress and ingress rules match the specified egress and ingress rules exactly (excluding the default egress/ingress rules).
   - You can refer to most things (network ACLs, VPCs, subnets) by their name tag, CIDR block or actual resource ID (VPC ID, subnet ID...).
   - If disassociating, VPC or NACL does not need to be specified, only the list of subnets that you want to reset back to the default network ACL.
   - If egress and ingress rules are not specified, then the network ACL will not be modified.  If you want all rules removed to match an empty ingress and egress ruleset, set purge_rules to True.
-  - ACL rule fields are rule_number, protocol (all, icmp, udp, tcp), rule_action (allow/deny), cidr_block, icmp_code, icmp_type, and port_range_from + port_range_to.  icmp_code and _type need only be specified if protocol is set to 'icmp'.  port_range_from and port_range_to should be specified if protocol is 'tcp' or 'udp'.
+  - ACL rule fields are rule_number, protocol (all, icmp, udp, tcp), rule_action (allow/deny), cidr_block, icmp_code, icmp_type, and port_range_from + port_range_to.  icmp_code and _type need only be specified if protocol is set to 'icmp'.  port_range_from and port_range_to should be specified if protocol is 'tcp' or 'udp'. Port numbers (port_range_from, port_range_to) can be specified as "max" to mean the maximum TCP/UDP port number.
 '''
 
 EXAMPLES = '''
 
-# Create and a network ACL that allows SSH and HTTP in,  and all traffic out.
+# Create and a network ACL that allows SSH and HTTP in, and all traffic out.
 # Ensure that the subnets named 'prod-dmz-1' and 'prod-dmz-2' are associated
 # with this ACL.
 - name: "Create and associate production DMZ network ACL"
@@ -104,81 +116,81 @@ EXAMPLES = '''
 
 # Same as above, but with rules in dict format
 - name: "Create and associate production DMZ network ACL"
-    ec2_vpc_nacl:
-        vpc: 'prod'
-        nacl: 'prod-dmz'
-        region: 'us-east-1'
-        subnets: ['prod-dmz-1', 'prod-dmz-2']
-        ingress: [
-          {'rule_number': 100,
-           'protocol': 'tcp',
-           'rule_action': 'allow',
-           'cidr_block': '0.0.0.0/0',
-           'icmp_code': null,
-           'icmp_type': null,
-           'port_range_from': 22,
-           'port_range_to': 22},
+  ec2_vpc_nacl:
+    vpc: 'prod'
+    nacl: 'prod-dmz'
+    region: 'us-east-1'
+    subnets: ['prod-dmz-1', 'prod-dmz-2']
+    ingress: [
+      {'rule_number': 100,
+       'protocol': 'tcp',
+       'rule_action': 'allow',
+       'cidr_block': '0.0.0.0/0',
+       'icmp_code': null,
+       'icmp_type': null,
+       'port_range_from': 22,
+       'port_range_to': 22},
 
-          {'rule_number': 200,
-           'protocol': 'tcp',
-           'rule_action': 'allow',
-           'cidr_block': '0.0.0.0/0',
-           'icmp_code': null,
-           'icmp_type': null,
-           'port_range_from': 80,
-           'port_range_to': 80},
-        ]
-        egress: [
-          {'rule_number': 100,
-           'protocol': 'all',
-           'rule_action': 'allow',
-           'cidr_block': '0.0.0.0/0',
-           'icmp_code': null,
-           'icmp_type': null,
-           'port_range_from': null,
-           'port_range_to': null},
-        ]
-        state: 'present'
+      {'rule_number': 200,
+       'protocol': 'tcp',
+       'rule_action': 'allow',
+       'cidr_block': '0.0.0.0/0',
+       'icmp_code': null,
+       'icmp_type': null,
+       'port_range_from': 80,
+       'port_range_to': 80},
+    ]
+    egress: [
+      {'rule_number': 100,
+       'protocol': 'all',
+       'rule_action': 'allow',
+       'cidr_block': '0.0.0.0/0',
+       'icmp_code': null,
+       'icmp_type': null,
+       'port_range_from': null,
+       'port_range_to': null},
+    ]
+    state: 'present'
 
 # Same as above, but with unneeded fields removed (icmp_code, icmp_type)
 - name: "Create and associate production DMZ network ACL"
-    ec2_vpc_nacl:
-        vpc: 'prod'
-        nacl: 'prod-dmz'
-        region: 'us-east-1'
-        subnets: ['prod-dmz-1', 'prod-dmz-2']
-        ingress: [
-          {'rule_number': 100,
-           'protocol': 'tcp',
-           'rule_action': 'allow',
-           'cidr_block': '0.0.0.0/0',
-           'port_range_from': 22,
-           'port_range_to': 22},
+  ec2_vpc_nacl:
+    vpc: 'prod'
+    nacl: 'prod-dmz'
+    region: 'us-east-1'
+    subnets: ['prod-dmz-1', 'prod-dmz-2']
+    ingress: [
+      {'rule_number': 100,
+       'protocol': 'tcp',
+       'rule_action': 'allow',
+       'cidr_block': '0.0.0.0/0',
+       'port_range_from': 22,
+       'port_range_to': 22},
 
-          {'rule_number': 200,
-           'protocol': 'tcp',
-           'rule_action': 'allow',
-           'cidr_block': '0.0.0.0/0',
-           'port_range_from': 80,
-           'port_range_to': 80},
-        ]
-        egress: [
-          {'rule_number': 100,
-           'protocol': 'all',
-           'rule_action': 'allow',
-           'cidr_block': '0.0.0.0/0',
-           'port_range_from': null,
-           'port_range_to': null},
-        ]
-        state: 'present'
+      {'rule_number': 200,
+       'protocol': 'tcp',
+       'rule_action': 'allow',
+       'cidr_block': '0.0.0.0/0',
+       'port_range_from': 80,
+       'port_range_to': 80},
+    ]
+    egress: [
+      {'rule_number': 100,
+       'protocol': 'all',
+       'rule_action': 'allow',
+       'cidr_block': '0.0.0.0/0',
+       'port_range_from': null,
+       'port_range_to': null},
+    ]
+    state: 'present'
 
 # Ensure the network ACL named 'legacy-dmz' has no subnets associated with it
 - name: "Disassociate legacy-dmz"
-    ec2_vpc_nacl:
-        vpc: 'core'
-        nacl: 'legacy-dmz'
-        region: 'us-east-1'
-        state: 'disassociated'
+  ec2_vpc_nacl:
+    vpc: 'core'
+    nacl: 'legacy-dmz'
+    region: 'us-east-1'
+    state: 'disassociated'
 
 # Ensure that a network ACL with a wide-open ingress and egress rule is removed
 - name: "Remove open network ACL"
@@ -194,6 +206,19 @@ EXAMPLES = '''
           [100, 'all', 'allow', '0.0.0.0/0', null, null, null, null]
       ]
       state: 'absent'
+
+# Create a rule permitting TCP on all incoming ports on the test VPC
+# (from port 0 to maximum port number)
+- name: "Create NACL permitting TCP on all ports"
+  ec2_vpc_nacl:
+      vpc: 'test'
+      region: 'us-east-1'
+      ingress: [
+          # rule no, protocol, allow/deny, cidr, icmp_code, icmp_type,
+          #                                             port from, port to
+          [100, 'tcp', 'allow', '0.0.0.0/0', null, null, 0, "max"],
+      ]
+      state: 'present'
 
 '''
 
@@ -237,6 +262,8 @@ DEFAULT_RULE_FIELDS = {
 DEFAULT_INGRESS = dict(DEFAULT_RULE_FIELDS.items() + [('egress', False)])
 DEFAULT_EGRESS = dict(DEFAULT_RULE_FIELDS.items() + [('egress', True)])
 
+# Maximum TCP/UDP port
+MAX_PORT_NUM = 65535
 
 # VPC-supported IANA protocol numbers
 # http://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml
@@ -252,7 +279,7 @@ awsapi = None
 def find_one_aws_resource(
         resource_get_func, parameters_list, selector_func=None):
     '''
-    Given a function to fetch AWS resources and a list of parameter dicts,
+    Given a function to get AWS resources and a list of parameter dicts,
     calls the get function with each parameter dict until a single resource
     is found.
 
@@ -262,7 +289,7 @@ def find_one_aws_resource(
 
     If a single resource is found or isolated, return it.
     If no resources are found with every attempt, return None.
-    Else we can't find a single resource, raises TooManyItems.
+    Else we can't find a single resource, raise TooManyItems.
     '''
     results = list()
 
@@ -517,12 +544,20 @@ class AWSAPI(object):
         self.conn = boto.vpc.connect_to_region(region, **boto_params)
         if not self.conn:
             raise LocalModuleException(
-                'Failed to initialize connection to AWS.')
+                'Failed to initialize connection to AWS. '
+                'Double-check AWS region and boto configuration.')
 
     def associate_subnet(self, networkacl_id, subnet_id):
+        '''
+        Given a network ACL ID and a subnet ID, associate the subnet with
+        the network ACL.
+        '''
         return self.conn.associate_network_acl(networkacl_id, subnet_id)
 
     def create_network_acl_entry(self, networkacl_id, **rule_fields):
+        '''
+        Given a network ACL ID, add the specified parameters to add a new rule.
+        '''
         return self.conn.create_network_acl_entry(networkacl_id, **rule_fields)
 
     def create_nacl_from_ruleset(self, vpc_id, ruleset):
@@ -858,6 +893,16 @@ class NaclEntry(namedtuple('NaclEntry', ACL_ENTRY_FIELDS)):
         if isinstance(fields['rule_action'], basestring):
             fields['rule_action'] = fields['rule_action'].lower()
 
+        if isinstance(fields['port_range_to'], basestring):
+            to_port = fields['port_range_to']
+            if to_port.lower() == 'max':
+                fields['port_range_to'] = MAX_PORT_NUM
+
+        if isinstance(fields['port_range_from'], basestring):
+            from_port = fields['port_range_from']
+            if from_port.lower() == 'max':
+                fields['port_range_from'] = MAX_PORT_NUM
+
         for field in fields:
             if isinstance(fields[field], int):
                 fields[field] = unicode(fields[field])
@@ -1064,19 +1109,17 @@ class NetworkACLModule(object):
 
         if self.state in self.STATES['PRESENT']:
 
-            if self.nacl_identifier and self.ruleset_present:
-
-                actions = [find_possible_nacl,
-                           self.create_nacl_action,
-                           self.modify_nacl_to_ruleset_action,
-                           self.associate_subnets_action,
-                           self.refresh_nacl_action]
+            if self.nacl_identifier and not self.ruleset_present:
+                actions = [self.find_nacl_action]
             else:
+                actions = [find_possible_nacl,
+                           self.create_nacl_action]
 
-                actions = [self.find_nacl_action,
-                           self.create_nacl_action,
-                           self.associate_subnets_action,
-                           self.refresh_nacl_action]
+            actions = actions + \
+                [self.modify_nacl_action,
+                 self.modify_nacl_to_ruleset_action,
+                 self.associate_subnets_action,
+                 self.refresh_nacl_action]
 
         elif self.state in self.STATES['REMOVED']:
 
@@ -1182,18 +1225,25 @@ class NetworkACLModule(object):
         return actionresult
 
     def find_nacl_action(self, actionresult, fail_on_not_found=True):
+        '''
+        Find the NACL as described by the given identifier.
 
+        If fail_on_not_found is set to True, raises an Exception if
+        none could be located as per given module parameters.
+        '''
         target_nacl = self.find_identified_nacl(
             fail_on_not_found=fail_on_not_found)
 
         if not target_nacl and self.ruleset:
             if not self.vpc:
                 raise ValueError(
-                    'VPC not found or set.  No NACL identifier has been set,'
+                    'VPC not found or set.  No NACL identifier has been set, '
                     'so searching by ruleset, which requires a valid VPC '
                     'identifier.')
 
-            # Go look for a network ACL that matches the ruleset we have
+            # If we're here, then no explicit network ACL was specified,
+            # but we have been given a ruleset.  So we should go look for
+            # a network ACL that matches the ruleset we've been given.
             target_nacl = \
                 self.aws.find_nacl_matching_ruleset(self.vpc.id, self.ruleset)
 
@@ -1208,40 +1258,33 @@ class NetworkACLModule(object):
 
     def create_nacl_action(self, actionresult):
         '''
-        Find the network ACL specified by module params, or create a new one
-        as the situation dictates.
-
-        Returns a (bool, []) tuple in the format (changed, data)
+        Create a NACL if none currently present.
         '''
-        target_nacl = actionresult.nacl
-        tags = self.tags or dict()
 
-        if self.nacl_identifier and \
-                not is_cidr_format(self.nacl_identifier) and \
-                not resembles_nacl_id(self.nacl_identifier):
-            tags.update({'Name':  self.nacl_identifier})
-
-        if not target_nacl:
-            if not self.ruleset:
+        if not actionresult.nacl:
+            if not self.ruleset_present:
                 raise ValueError(
                     'Egress/ingress ruleset required when creating network '
                     'ACL.')
 
-            target_nacl = \
+            actionresult.nacl = \
                 self.aws.create_nacl_from_ruleset(self.vpc.id, self.ruleset)
 
-            if target_nacl:
+            if actionresult.nacl:
                 actionresult.changed = True
 
-        if target_nacl and tags:
-            if target_nacl.tags != tags:
-                target_nacl.add_tags(tags)
-                actionresult.changed = True
+        if not actionresult.nacl:
+            # If we're at this point and we don't have a network ACL object,
+            # something went very wrong.
+            raise LocalModuleException(
+                'No network ACL module located or created.')
 
-        actionresult.nacl = target_nacl
         return actionresult
 
     def refresh_nacl_action(self, actionresult):
+        '''
+        Get the latest state of the current network ACL from AWS.
+        '''
         if not actionresult.nacl:
             return actionresult
 
@@ -1305,11 +1348,40 @@ class NetworkACLModule(object):
         actionresult.nacl_list = map(nacl_to_dict, nacls)
         return actionresult
 
+    def modify_nacl_action(self, actionresult):
+        '''
+        Make changes to NACL attributes (such as tags) if necessary.
+        '''
+        if not actionresult.nacl:
+            return actionresult
+
+        target_nacl = actionresult.nacl
+        tags = self.tags or dict()
+
+        # If the given NACL identifier does not look like a CIDR
+        # or network ACL ID, then it's a name, and if the name tag
+        # is not already specified, then set this as the name.
+        if self.nacl_identifier and \
+                not is_cidr_format(self.nacl_identifier) and \
+                not resembles_nacl_id(self.nacl_identifier) and \
+                'Name' not in tags:
+            tags.update({'Name':  self.nacl_identifier})
+
+        if target_nacl and tags:
+            if target_nacl.tags != tags:
+                target_nacl.add_tags(tags)
+                actionresult.changed = True
+
+        return actionresult
+
     def modify_nacl_to_ruleset_action(self, actionresult):
         '''
         Modify the current network ACL to match the current ruleset.
         '''
         if not actionresult.nacl:
+            return actionresult
+
+        if not self.ruleset_present:
             return actionresult
 
         current_ruleset = RuleSet(actionresult.nacl)
@@ -1351,15 +1423,19 @@ def get_ansible_module():
     argument_spec = ec2_argument_spec()
 
     argument_spec.update(dict(
-        nacl=dict(required=False),
-        use_default_nacl=dict(required=False, type='bool', default=False),
+        egress=dict(
+            required=False, type='list', default=list(),
+            aliases=['rules_egress']),
+        ingress=dict(
+            required=False, type='list', default=list(),
+            aliases=['rules']),
+        nacl=dict(required=False, aliases=['name']),
         purge_rules=dict(required=False, type='bool', default=False),
-        ingress=dict(required=False, type='list', default=list()),
-        egress=dict(required=False, type='list', default=list()),
-        vpc=dict(required=False),
+        state=dict(default='present', choices=valid_states),
         subnets=dict(required=False, type='list', default=list()),
-        tags=dict(required=False, type='dict'),
-        state=dict(default='present', choices=valid_states)
+        tags=dict(required=False, type='dict', aliases=['resource_tags']),
+        use_default_nacl=dict(required=False, type='bool', default=False),
+        vpc=dict(required=False, aliases=['vpc_id']),
         ),
     )
 
@@ -1370,17 +1446,19 @@ def get_ansible_module():
 def main():
 
     module = get_ansible_module()
-    networkacl_mod = NetworkACLModule(module)
     results = ActionResults()
+
+    try:
+        networkacl_mod = NetworkACLModule(module)
+    except (LocalModuleException, EC2ResponseError, ValueError), e:
+            module.fail_json(msg=e.message)
 
     action_list = networkacl_mod.get_action_sequence()
 
     for action in action_list:
         try:
             results = action(results)
-        except ValueError, e:
-            module.fail_json(msg=e.message)
-        except EC2ResponseError, e:
+        except (LocalModuleException, EC2ResponseError, ValueError), e:
             module.fail_json(msg=e.message)
 
     module.exit_json(**results.as_dict())
