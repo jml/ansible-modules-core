@@ -501,6 +501,8 @@ def connection_as_dict(connection):
         return dict()
 
     return {
+        'id': connection.id,
+        'expiration': connection.expiration_time or '',
         'source_vpc_id':  connection.requester_vpc_info.vpc_id,
         'source_vpc_cidr': connection.requester_vpc_info.cidr_block,
         'peer_vpc_id': connection.accepter_vpc_info.vpc_id,
@@ -542,7 +544,8 @@ def main():
             peer_owner_id = dict(required=False),
             state = dict(
                 choices=['absent', 'present', 'active', 'pending', 'list'],
-                required=True),
+                default='present',
+                required=False),
             force_accept = dict(required=False, type='bool', default=False),
             ignore_rejection = dict(
                 required=False, type='bool', default=False),
