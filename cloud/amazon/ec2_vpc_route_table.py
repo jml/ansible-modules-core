@@ -71,6 +71,13 @@ options:
       - how long before wait gives up, in seconds
     default: 300
     aliases: []
+  append_routes:
+    description:
+      - If set to true, routes will not be deleted from the route table; '''
+''' only specified routes that are missing will be created.
+    required: false
+    default: false
+    aliases: []
   state:
     description:
       - Create or terminate the VPC
@@ -307,7 +314,8 @@ def index_of_matching_route(route_spec, routes_to_match):
             return i
 
 
-def ensure_routes(vpc_conn, route_table, route_specs, check_mode):
+def ensure_routes(
+        vpc_conn, route_table, route_specs, check_mode, append_only=False):
     routes_to_match = list(route_table.routes)
     route_specs_to_create = []
     for route_spec in route_specs:
@@ -317,7 +325,7 @@ def ensure_routes(vpc_conn, route_table, route_specs, check_mode):
         else:
             del routes_to_match[i]
     routes_to_delete = [r for r in routes_to_match
-                        if r.gateway_id != 'local']
+                        if r.gateway_id != 'local'] if not append_only else []
 
     changed = routes_to_delete or route_specs_to_create
     if changed:
@@ -414,7 +422,7 @@ def ensure_route_table_absent(vpc_conn, vpc_id, route_table_id, resource_tags,
 
 def ensure_route_table_present(vpc_conn, vpc_id, route_table_id, resource_tags,
                                routes, subnets, propagating_vgw_ids,
-                               check_mode):
+                               check_mode, append_routes=False):
     changed = False
     tags_valid = False
     if route_table_id:
@@ -451,7 +459,8 @@ def ensure_route_table_present(vpc_conn, vpc_id, route_table_id, resource_tags,
 
     if routes is not None:
         try:
-            result = ensure_routes(vpc_conn, route_table, routes, check_mode)
+            result = ensure_routes(vpc_conn, route_table, routes, check_mode,
+                                   append_only=append_routes)
             changed = changed or result['changed']
         except EC2ResponseError as e:
             raise AnsibleRouteTableException(
@@ -494,6 +503,7 @@ def main():
         'resource_tags': {'type': 'dict', 'required': False},
         'routes': {'type': 'list', 'required': False},
         'subnets': {'type': 'list', 'required': False},
+        'append_routes': {'type': 'bool', 'required': False},
         'state': {'choices': ['present', 'absent'], 'default': 'present'},
     })
     module = AnsibleModule(
@@ -525,6 +535,7 @@ def main():
     for route_spec in routes:
         rename_key(route_spec, 'dest', 'destination_cidr_block')
 
+    append_routes = module.params.get('append_routes')
     subnets = module.params.get('subnets')
     state = module.params.get('state', 'present')
 
@@ -532,7 +543,8 @@ def main():
         if state == 'present':
             result = ensure_route_table_present(
                 vpc_conn, vpc_id, route_table_id, resource_tags,
-                routes, subnets, propagating_vgw_ids, module.check_mode
+                routes, subnets, propagating_vgw_ids, module.check_mode,
+                append_routes=append_routes
             )
         elif state == 'absent':
             result = ensure_route_table_absent(
