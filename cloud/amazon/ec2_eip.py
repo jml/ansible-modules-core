@@ -18,7 +18,7 @@ options:
     required: false
   state:
     description:
-      _ If allocate, allocates a new elastic IP.
+      _ If allocated, allocates a new elastic IP.
       - If present, associate the IP with the instance.
       - If absent, disassociate the IP with the instance.
     required: false
@@ -76,7 +76,7 @@ EXAMPLES = '''
   debug: msg="Allocated IP is {{ eip.public_ip }}"
 
 - name: another way of allocating an elastic IP without associating it to anything
-  ec2_eip: state='allocate'
+  ec2_eip: state='allocated'
 
 - name: provision new instances with ec2
   ec2: keypair=mykey instance_type=c1.medium image=ami-40603AD1 wait=yes group=webserver count=3
@@ -250,13 +250,22 @@ def find_instance(ec2, instance_id, module):
     module.fail_json(msg="could not find instance" + instance_id)
     
 
+def allocate_eip(eip_domain):
+    # Allocate a new elastic IP
+    address = allocate_address(ec2, eip_domain, module, reuse_existing_ip_allowed)
+    # overriding the timeout since this is a a newly provisioned ip
+    global wait_timeout
+    wait_timeout = new_eip_timeout
+    return address
+
+
 def main():
     argument_spec = ec2_argument_spec()
     argument_spec.update(dict(
             instance_id = dict(required=False),
             public_ip = dict(required=False, aliases= ['ip']),
             state = dict(required=False, default='present',
-                         choices=['allocate', 'present', 'absent']),
+                         choices=['allocated', 'present', 'absent']),
             in_vpc = dict(required=False, type='bool', default=False),
             reuse_existing_ip_allowed = dict(required=False, type='bool', default=False),
             wait_timeout = dict(default=300),
@@ -281,15 +290,7 @@ def main():
     reuse_existing_ip_allowed = module.params.get('reuse_existing_ip_allowed')
     new_eip_timeout = int(module.params.get('wait_timeout'))
 
-    def allocate_eip(eip_domain):
-        # Allocate a new elastic IP
-        address = allocate_address(ec2, eip_domain, module, reuse_existing_ip_allowed)
-        # overriding the timeout since this is a a newly provisioned ip
-        global wait_timeout
-        wait_timeout = new_eip_timeout
-        return address
-
-    if state == 'allocate':
+    if state == 'allocated':
         # If we're allocating a new IP, stop if the user also specified an
         # instance or IP address.
         if instance_id or public_ip:
