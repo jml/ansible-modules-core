@@ -18,11 +18,10 @@ options:
     required: false
   state:
     description:
-      _ If allocated, allocates a new elastic IP.
       - If present, associate the IP with the instance.
       - If absent, disassociate the IP with the instance.
     required: false
-    choices: ['allocate', 'present', 'absent']
+    choices: ['present', 'absent']
     default: present
   region:
     description:
@@ -76,7 +75,7 @@ EXAMPLES = '''
   debug: msg="Allocated IP is {{ eip.public_ip }}"
 
 - name: another way of allocating an elastic IP without associating it to anything
-  ec2_eip: state='allocated'
+  ec2_eip: state='present'
 
 - name: provision new instances with ec2
   ec2: keypair=mykey instance_type=c1.medium image=ami-40603AD1 wait=yes group=webserver count=3
@@ -265,7 +264,7 @@ def main():
             instance_id = dict(required=False),
             public_ip = dict(required=False, aliases= ['ip']),
             state = dict(required=False, default='present',
-                         choices=['allocated', 'present', 'absent']),
+                         choices=['present', 'absent']),
             in_vpc = dict(required=False, type='bool', default=False),
             reuse_existing_ip_allowed = dict(required=False, type='bool', default=False),
             wait_timeout = dict(default=300),
@@ -290,19 +289,9 @@ def main():
     reuse_existing_ip_allowed = module.params.get('reuse_existing_ip_allowed')
     new_eip_timeout = int(module.params.get('wait_timeout'))
 
-    if state == 'allocated':
-        # If we're allocating a new IP, stop if the user also specified an
-        # instance or IP address.
-        if instance_id or public_ip:
-            module.fail_json(
-                msg='instance_id or public_ip should not be specified if only'+
-                    ' allocating an elastic IP.')
-        address = allocate_eip(domain)
-        module.exit_json(changed=True, public_ip=address.public_ip)
-
-    elif state == 'present':
-        # If both instance_id and public_ip are not specified, fall back on
-        # previous behavior, which is to allocate a new elastic IP, and exit.
+    if state == 'present':
+        # If both instance_id and public_ip are not specified, allocate a new
+        # elastic IP, and exit.
         if not instance_id and not public_ip:
             address = allocate_eip(domain)
             module.exit_json(changed=True, public_ip=address.public_ip)
